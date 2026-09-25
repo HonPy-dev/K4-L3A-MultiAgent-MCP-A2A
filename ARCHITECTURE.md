@@ -42,12 +42,14 @@ least-privilege và tránh call invalid.
 - Envelope handoff (logic, không trace payload): `{case_id, from_actor, to_actor,
   handoff_reason}` → trace `event_type=handoff, actor=from, target=to`.
 - Thứ tự edges: `task_assigned x3` → `tool_result_consumed` (specialists) →
-  `handoff coordinator→policy-agent` → `tool_result_consumed get_policy` →
-  `policy_decided` → `handoff policy-agent→verifier` → `verification_completed`.
+  `handoff shipment-agent→coordinator` (fan-in) → `handoff coordinator→policy-agent` →
+  `tool_result_consumed get_policy` → `policy_decided` → `handoff policy-agent→verifier`
+  → `verification_completed`.
 - DAG một chiều, không vòng lặp. Specialists chạy tuần tự (concurrency 1/case)
   để trace deterministic.
 - Timeout: dựa vào `mcp_gateway.py:connect_gateway()` (`connect/write/pool 30s`,
-  tổng 300s). Mỗi tool retry tối đa 2 lần (mục 5).
+  tổng 300s). Retry mặc định 2 lần; `get_order`/`get_policy` 3 lần vì là linchpin
+  (entities/rules).
 - Chỉ trace sự kiện/decision code quan sát được (`trace-event-v1.schema.json` 7
   loại); không trace prompt hay chain-of-thought.
 
@@ -62,18 +64,23 @@ least-privilege và tránh call invalid.
    `actor/tool_name/evidence_refs` — đảm bảo evidence-to-trace linkage cho điểm
    `workflow` (mean lifecycle coverage + ordering + collaboration + linkage).
 4. Map vào output: `output.evidence_refs` = unique tất cả refs (max 30);
-   `claim_assessments[].evidence_refs` = subset liên quan (order-claim →
-   order/item/seller/product refs; payment-claim → payment refs). Mọi ref trong
-   output đều đã xuất hiện trong trace.
+   per-claim refs thu hẹp theo domain thật sự hỗ trợ (`_refs_for_topic`):
+   refund-claim → payment/policy; late_delivery → shipment/order/policy;
+   payment topics → payment/order/policy; canceled/unavailable → order/payment/policy.
+   Mọi ref trong output đều đã xuất hiện trong trace.
 5. `primary_issue` = claim topic đầu tiên khác `requested_full_refund`
    (mỗi case có 1 topic chuyên biệt + 1 `requested_full_refund`); map 1-1 với
-   `primaryIssue` enum trong `l3a-output-v2.schema.json`.
+   `primaryIssue` enum trong `l3a-output-v2.schema.json`. Trước khi giữ verdict
+   `supported`, cross-validate topic với tín hiệu evidence (`_topic_support`:
+   order_status, late-delivery events, reconciliation_mismatch, duplicate/split
+   payments, refund events); mâu thuẫn → hạ verdict `partially_supported`
+   nhưng không đổi `primary_issue` (ngưỡng override chưa đạt).
 
 ## 5. Failure policy
 
 | Failure | Retry? | Fallback | Trace event/code |
 | --- | --- | --- | --- |
-| MCP timeout / transport error | Có, tối đa 2 attempts, idempotent (cùng `case_id` + args) | Bỏ tool đó, tiếp tục tool khác; không bịa data | Không emit `tool_result_consumed` cho call thất bại |
+| MCP timeout / transport error | Có, 2 attempts (linchpin `get_order`/`get_policy`: 3), idempotent (cùng `case_id` + args) | Bỏ tool đó, tiếp tục tool khác; không bịa data | Không emit `tool_result_consumed` cho call thất bại |
 | Tool not found / invalid args (`get_refund_timeline`, `get_customer_history` hay lỗi) | Có, 2 attempts rồi bỏ | Coi như evidence nhóm đó thiếu; giảm confidence | Verifier ghi `verified_with_warnings` nếu thiếu |
 | Source conflict (items trùng `order_item_id` khác `freight_value`/`shipping_limit_date`) | Không | Giữ cả 2 evidence, emit 1 `data_conflicts[]` `use_first_observed` | Conflict nằm trong output, không thêm trace |
 | Invalid specialist result / rỗng toàn bộ | Không | Output `insufficient_evidence`, `needs_investigation`, confidence 0.4, refund 0 | `policy_decided=insufficient_evidence`, `verification_completed=fallback_insufficient_evidence` |
@@ -96,11 +103,17 @@ Trước finalize, verifier kiểm (observable, không đoán):
   refund > 0, ngược lại `unsupported`.
 - Money totals: `sum(refund_lines.amount_brl) == recommended_refund_brl`;
   `refund_lines` rỗng khi refund = 0; `currency const BRL`.
+- Status/refund/action: `no_action ⇒ refund 0`, `action_required ⇒ refund > 0`,
+  `needs_investigation` mở; vi phạm → `verified_with_warnings`.
 - Responsibility/action consistency: `responsible_parties` từ policy rule
   (party seller thay bằng seller_id thực tế từ evidence);
+  `refund_lines.entity_id` bám theo bên chịu trách nhiệm (seller có id → seller đó,
+  ngược lại → order_id);
   `resolution_actions=[recommended_action]`; `cause_code=PRIMARY_ISSUE.upper()`.
 - Confidence bounds: 0.9 khi đủ 4 nhóm (order/payment/shipment/policy), 0.75 khi
-  thiếu 1 nhóm, 0.6 khi thiếu nhiều hơn.
+  thiếu 1 nhóm, 0.6 khi thiếu nhiều hơn. Không bao giờ 1.0. Cap thêm khi evidence
+  có vấn đề: mâu thuẫn claim (`_topic_support` contradict) → tối đa 0.65;
+  `data_conflicts` non-empty → tối đa 0.75.
 
 ## 7. Reproducibility
 
@@ -113,7 +126,11 @@ Trước finalize, verifier kiểm (observable, không đoán):
 - Lệnh chạy: `day09 run` → `day09 validate` → `day09 package --output
   dist/submission.zip`. Output tại `outputs/<case_id>.json`,
   trace tại `traces/trace.jsonl`.
-- Giới hạn: mỗi case tối đa 9 MCP calls (4 order + 3 payment + 1 shipment +
-  1 policy); `get_refund_timeline` có thể thất bại tùy case là bình thường.
+- Giới hạn: mỗi case tối đa 9 MCP calls nhưng gọi có điều kiện để tối ưu efficiency
+  (mọi call fail hay success đều bị audit): `get_sellers` bỏ qua khi items đã có
+  `seller_id` và topic không thuộc nhóm seller-liable; `get_product_context` bỏ qua
+  cho topic payment/refund thuần; `get_refund_timeline` chỉ gọi khi topic thuộc nhóm
+  refund/dispute hoặc payment timeline có refund events. Thực tế 7–8 calls/case.
+  `get_refund_timeline` fail tùy case là bình thường (tương đương bỏ qua).
 - Không ghi API key, prompt bí mật hay chain-of-thought vào output/trace
   (`submission.py` quét `sk-team-` trước khi package).

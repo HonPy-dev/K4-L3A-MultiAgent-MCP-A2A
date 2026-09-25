@@ -71,18 +71,22 @@ _FALLBACK_RULES: dict[str, dict[str, Any]] = {
 
 _PRIMARY_ISSUES = set(_FALLBACK_RULES) | {"insufficient_evidence"}
 
+# Linchpin tools get one extra retry: order anchors entities, policy anchors rules.
+_RETRY_ATTEMPTS = {"get_order": 3, "get_policy": 3}
+
 
 async def _call_tool(
     gateway: EvidenceGateway,
     tool_name: str,
     *,
     case_id: str,
-    attempts: int = 2,
+    attempts: int | None = None,
     **kwargs: str,
 ) -> dict[str, Any] | None:
     """Bounded idempotent retry. Returns None instead of guessing data."""
+    budget = attempts if attempts is not None else _RETRY_ATTEMPTS.get(tool_name, 2)
     last_error: Exception | None = None
-    for _ in range(max(1, attempts)):
+    for _ in range(max(1, budget)):
         try:
             return await gateway.call(tool_name, case_id=case_id, **kwargs)
         except Exception as exc:  # noqa: BLE001 - MCP failures are expected signals
@@ -119,47 +123,253 @@ def _primary_issue_for(case: dict[str, Any]) -> str:
     return "unsupported_claim"
 
 
+def _evidence_signals(evidence: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Observable boolean signals extracted verbatim from MCP evidence."""
+    order = (evidence.get("get_order") or {}).get("data", {})
+    order_status = order.get("order_status") if isinstance(order, dict) else None
+    delivered_customer = None
+    if isinstance(order, dict):
+        delivered_customer = order.get("order_delivered_customer_date")
+
+    shipment = (evidence.get("get_shipment_summary") or {}).get("data", {})
+    ship = shipment if isinstance(shipment, dict) else {}
+    ship_events = _as_list(ship.get("events"))
+    ship_late = any(
+        isinstance(evt, dict) and evt.get("event_type") == "delivered_late" for evt in ship_events
+    )
+    delivered_at = ship.get("delivered_customer_at")
+    estimated_at = ship.get("estimated_delivery_at")
+    past_estimate = bool(
+        isinstance(delivered_at, str)
+        and isinstance(estimated_at, str)
+        and delivered_at > estimated_at
+    )
+
+    timeline = (evidence.get("get_payment_timeline") or {}).get("data", {})
+    pay_events = _as_list(timeline.get("events") if isinstance(timeline, dict) else [])
+    mismatch = any(
+        isinstance(evt, dict) and evt.get("event_type") == "reconciliation_mismatch"
+        for evt in pay_events
+    )
+
+    payments = _as_list((evidence.get("get_order_payments") or {}).get("data"))
+    pay_keys = [
+        (row.get("payment_sequential"), row.get("payment_type"), row.get("payment_value"))
+        for row in payments
+        if isinstance(row, dict)
+    ]
+    duplicate_pay = len(pay_keys) != len(set(pay_keys)) and len(pay_keys) > 0
+    split_pay = len({key[1] for key in pay_keys}) > 1
+
+    refund_tl = (evidence.get("get_refund_timeline") or {}).get("data", {})
+    refund_events = _as_list(refund_tl.get("events") if isinstance(refund_tl, dict) else [])
+    refund_types = {str(evt.get("event_type")) for evt in refund_events if isinstance(evt, dict)}
+
+    return {
+        "order_status": order_status,
+        "delivered_customer": delivered_customer,
+        "ship_late": ship_late,
+        "past_estimate": past_estimate,
+        "mismatch": mismatch,
+        "duplicate_pay": duplicate_pay,
+        "split_pay": split_pay,
+        "refund_types": refund_types,
+    }
+
+
+def _topic_support(topic: str, signals: dict[str, Any]) -> tuple[int, int]:
+    """Return (support, contradict) signal counts for a claimed topic."""
+    status = signals["order_status"]
+    if topic == "canceled_order_paid":
+        support = 1 if status == "canceled" else 0
+        contradict = 1 if status == "delivered" and signals["delivered_customer"] else 0
+        return support, contradict
+    if topic == "unavailable_order_paid":
+        support = 1 if status == "unavailable" else 0
+        contradict = 1 if status == "delivered" and signals["delivered_customer"] else 0
+        return support, contradict
+    if topic in ("late_delivery_seller", "late_delivery_logistics"):
+        support = int(bool(signals["ship_late"])) + int(bool(signals["past_estimate"]))
+        contradict = 1 if status in ("canceled", "unavailable") else 0
+        return support, contradict
+    if topic == "valid_split_payment":
+        return int(bool(signals["split_pay"])), 0
+    if topic == "payment_mismatch":
+        return int(bool(signals["mismatch"])), 0
+    if topic == "duplicate_charge":
+        return int(bool(signals["duplicate_pay"])), 0
+    if topic == "refund_pending":
+        support = int(bool({"refund_requested", "pending"} & signals["refund_types"]))
+        return support, 0
+    if topic == "refund_failed":
+        support = int(bool({"refund_failed", "failed"} & signals["refund_types"]))
+        return support, 0
+    return 0, 0
+
+
+def _refs_for_topic(
+    topic: str,
+    order_refs: list[str],
+    payment_refs: list[str],
+    shipment_refs: list[str],
+    policy_refs: list[str],
+) -> list[str]:
+    """Domain-targeted refs: only evidence that truly supports the claim topic."""
+    if topic == "requested_full_refund":
+        return _unique(payment_refs + policy_refs)[:10]
+    if topic in ("canceled_order_paid", "unavailable_order_paid"):
+        return _unique(order_refs + payment_refs + policy_refs)[:10]
+    if topic in ("late_delivery_seller", "late_delivery_logistics"):
+        return _unique(shipment_refs + order_refs + policy_refs)[:10]
+    if topic in ("payment_mismatch", "duplicate_charge", "valid_split_payment"):
+        return _unique(payment_refs + order_refs + policy_refs)[:10]
+    if topic in ("refund_pending", "refund_failed"):
+        return _unique(payment_refs + policy_refs + order_refs)[:10]
+    return _unique(policy_refs + order_refs)[:10]
+
+
+# Topics where the seller-domain evidence group is directly liability-relevant.
+_SELLER_LIABLE_TOPICS = {"late_delivery_seller", "unavailable_order_paid"}
+# Topics where item/product detail supports the claim.
+_ITEM_RELEVANT_TOPICS = {
+    "canceled_order_paid",
+    "unavailable_order_paid",
+    "late_delivery_seller",
+    "late_delivery_logistics",
+}
+# Topics where a refund timeline is expected to exist.
+_REFUND_EXPECTED_TOPICS = {
+    "refund_pending",
+    "refund_failed",
+    "payment_mismatch",
+    "duplicate_charge",
+}
+
+
+async def _consume(
+    gateway: EvidenceGateway,
+    trace: TraceWriter,
+    state: dict[str, Any],
+    *,
+    case_id: str,
+    actor: str,
+    tool_name: str,
+    kwargs: dict[str, str],
+) -> dict[str, Any] | None:
+    evidence = await _call_tool(gateway, tool_name, case_id=case_id, **kwargs)
+    if evidence is None:
+        return None
+    state["evidence"][tool_name] = evidence
+    state["evidence_refs"].append(str(evidence["evidence_ref"]))
+    trace.emit(
+        case_id=case_id,
+        event_type="tool_result_consumed",
+        actor=actor,
+        tool_name=tool_name,
+        evidence_refs=[str(evidence["evidence_ref"])],
+    )
+    return evidence
+
+
+def _item_seller_ids(evidence: dict[str, dict[str, Any]]) -> tuple[list[str], list[str]]:
+    items = _as_list((evidence.get("get_order_items") or {}).get("data"))
+    item_ids = [
+        str(r["order_item_id"]) for r in items if isinstance(r, dict) and r.get("order_item_id")
+    ]
+    seller_ids = [str(r["seller_id"]) for r in items if isinstance(r, dict) and r.get("seller_id")]
+    return _unique(item_ids), _unique(seller_ids)
+
+
 async def _order_item_agent(
     case_id: str,
     order_id: str,
+    topics: list[str],
     gateway: EvidenceGateway,
     trace: TraceWriter,
     state: dict[str, Any],
 ) -> None:
-    for tool_name in ("get_order", "get_order_items", "get_sellers", "get_product_context"):
-        evidence = await _call_tool(gateway, tool_name, case_id=case_id, order_id=order_id)
-        if evidence is None:
-            continue
-        state["evidence"][tool_name] = evidence
-        state["evidence_refs"].append(str(evidence["evidence_ref"]))
-        trace.emit(
+    await _consume(
+        gateway,
+        trace,
+        state,
+        case_id=case_id,
+        actor="order-agent",
+        tool_name="get_order",
+        kwargs={"order_id": order_id},
+    )
+    await _consume(
+        gateway,
+        trace,
+        state,
+        case_id=case_id,
+        actor="order-agent",
+        tool_name="get_order_items",
+        kwargs={"order_id": order_id},
+    )
+    _, item_sellers = _item_seller_ids(state["evidence"])
+    # Seller group: skip when items already supplied seller_ids and no
+    # seller-liability topic needs the authoritative seller record.
+    if not item_sellers or _SELLER_LIABLE_TOPICS.intersection(topics):
+        await _consume(
+            gateway,
+            trace,
+            state,
             case_id=case_id,
-            event_type="tool_result_consumed",
             actor="order-agent",
-            tool_name=tool_name,
-            evidence_refs=[str(evidence["evidence_ref"])],
+            tool_name="get_sellers",
+            kwargs={"order_id": order_id},
+        )
+    # Product group: skip for pure payment/refund topics when items exist.
+    item_ids, _ = _item_seller_ids(state["evidence"])
+    if not item_ids or _ITEM_RELEVANT_TOPICS.intersection(topics):
+        await _consume(
+            gateway,
+            trace,
+            state,
+            case_id=case_id,
+            actor="order-agent",
+            tool_name="get_product_context",
+            kwargs={"order_id": order_id},
         )
 
 
 async def _payment_agent(
     case_id: str,
     order_id: str,
+    topics: list[str],
     gateway: EvidenceGateway,
     trace: TraceWriter,
     state: dict[str, Any],
 ) -> None:
-    for tool_name in ("get_order_payments", "get_payment_timeline", "get_refund_timeline"):
-        evidence = await _call_tool(gateway, tool_name, case_id=case_id, order_id=order_id)
-        if evidence is None:
-            continue
-        state["evidence"][tool_name] = evidence
-        state["evidence_refs"].append(str(evidence["evidence_ref"]))
-        trace.emit(
+    for tool_name in ("get_order_payments", "get_payment_timeline"):
+        await _consume(
+            gateway,
+            trace,
+            state,
             case_id=case_id,
-            event_type="tool_result_consumed",
             actor="payment-agent",
             tool_name=tool_name,
-            evidence_refs=[str(evidence["evidence_ref"])],
+            kwargs={"order_id": order_id},
+        )
+    # Refund timeline: expected only for refund/payment-dispute topics or when
+    # the payment timeline itself shows refund activity. Skipping avoids audited
+    # calls that historically fail ~60% of the time without yielding evidence.
+    want_refund = bool(_REFUND_EXPECTED_TOPICS.intersection(topics))
+    if not want_refund:
+        timeline = (state["evidence"].get("get_payment_timeline") or {}).get("data", {})
+        events = _as_list(timeline.get("events") if isinstance(timeline, dict) else [])
+        want_refund = any(
+            isinstance(evt, dict) and "refund" in str(evt.get("event_type", "")) for evt in events
+        )
+    if want_refund:
+        await _consume(
+            gateway,
+            trace,
+            state,
+            case_id=case_id,
+            actor="payment-agent",
+            tool_name="get_refund_timeline",
+            kwargs={"order_id": order_id},
         )
 
 
@@ -315,6 +525,7 @@ async def solve_case(
     claims = customer_request.get("claims", [])
     if not isinstance(claims, list):
         claims = []
+    topics = [str(c.get("topic", "")) for c in claims if isinstance(c, dict)]
 
     state: dict[str, Any] = {"evidence": {}, "evidence_refs": []}
 
@@ -328,10 +539,12 @@ async def solve_case(
         )
 
     # Specialists run sequentially for determinism (concurrency limit 1).
-    await _order_item_agent(case_id, order_id, gateway, trace, state)
-    await _payment_agent(case_id, order_id, gateway, trace, state)
+    await _order_item_agent(case_id, order_id, topics, gateway, trace, state)
+    await _payment_agent(case_id, order_id, topics, gateway, trace, state)
     await _shipment_agent(case_id, order_id, gateway, trace, state)
 
+    # Fan-in: last specialist hands results back to the coordinator.
+    trace.emit(case_id=case_id, event_type="handoff", actor="shipment-agent", target="coordinator")
     trace.emit(case_id=case_id, event_type="handoff", actor="coordinator", target="policy-agent")
 
     # Policy agent decides the business outcome from authoritative rules.
@@ -405,6 +618,7 @@ async def solve_case(
     )
 
     # Confidence: high when all specialist groups + policy responded.
+    # Never overconfident: cap when evidence contradicts the claim or conflicts.
     groups_ok = sum(
         [
             any(k in evidence for k in ("get_order", "get_order_items")),
@@ -414,6 +628,12 @@ async def solve_case(
         ]
     )
     confidence = 0.9 if groups_ok == 4 else (0.75 if groups_ok == 3 else 0.6)
+    signals = _evidence_signals(evidence)
+    claimed_support, claimed_contra = _topic_support(primary_issue, signals)
+    if claimed_contra > 0:
+        confidence = min(confidence, 0.65)
+    if _detect_conflicts(evidence):
+        confidence = min(confidence, 0.75)
 
     # Claim assessments link each input claim to supporting evidence.
     order_refs = [
@@ -443,15 +663,22 @@ async def solve_case(
         topic = str(claim.get("topic", ""))
         if topic == "requested_full_refund":
             verdict = "supported" if refund_amount > 0 else "unsupported"
-            refs = _unique(payment_refs + policy_refs + order_refs)[:10]
+            refs = _refs_for_topic(topic, order_refs, payment_refs, shipment_refs, policy_refs)
             claim_conf = confidence if verdict == "supported" else 0.7
         elif topic == primary_issue:
-            verdict = "supported"
-            refs = _unique(order_refs + payment_refs + shipment_refs + policy_refs)[:10]
-            claim_conf = confidence
+            support, contradict = _topic_support(topic, signals)
+            refs = _refs_for_topic(topic, order_refs, payment_refs, shipment_refs, policy_refs)
+            if contradict == 0:
+                verdict = "supported"
+                claim_conf = confidence
+            else:
+                # Evidence contradicts the claim: downgrade verdict, keep primary
+                # (override threshold for primary_issue itself is not met).
+                verdict = "partially_supported"
+                claim_conf = 0.55
         else:
             verdict = "unsupported"
-            refs = _unique(policy_refs)[:10]
+            refs = _refs_for_topic(topic, order_refs, payment_refs, shipment_refs, policy_refs)
             claim_conf = 0.65
         if not refs:
             verdict = "insufficient_evidence"
@@ -467,11 +694,16 @@ async def solve_case(
 
     refund_lines: list[dict[str, Any]] = []
     if refund_amount > 0:
+        # The refund entity follows the responsible party: a liable seller refunds,
+        # otherwise the order (platform/provider) is the accountable entity.
+        payer = order_id
+        if responsible and responsible[0].get("party_type") == "seller":
+            payer = str(responsible[0].get("party_id") or order_id)
         refund_lines.append(
             {
                 "reason_code": recommended_action[:80],
                 "amount_brl": refund_amount,
-                "entity_id": order_id,
+                "entity_id": payer,
             }
         )
 
@@ -519,6 +751,11 @@ async def solve_case(
             for ref in assessment["evidence_refs"]
         )
         and 0 <= confidence <= 1
+        and (
+            (case_status == "no_action" and refund_amount == 0.0)
+            or (case_status == "action_required" and refund_amount > 0.0)
+            or (case_status == "needs_investigation")
+        )
     )
     trace.emit(
         case_id=case_id,
